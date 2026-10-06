@@ -107,6 +107,90 @@ def merge_record_extra(
 
 ### CLASSES
 ### ============================================================================
+class FieldOutputPlan:
+    """Validated plan describing the final output field names.
+
+    `rename_fields` and `static_fields` are merged into a single plan at
+    construction time (i.e. when a formatter is configured), before any
+    `logging.LogRecord` is read or any serializer is called. If the two sources
+    would produce the same final field name, a `ValueError` is raised and the
+    formatter is never handed the invalid plan.
+
+    Small mapping examples:
+
+    ```python
+    # valid: "levelname" is emitted as "LEVEL"
+    FieldOutputPlan(rename_fields={"levelname": "LEVEL"})
+
+    # valid: the static field is emitted using its renamed output name
+    FieldOutputPlan(rename_fields={"svc": "service.name"}, static_fields={"svc": "demo"})
+
+    # invalid: two rename sources map to the same output name
+    FieldOutputPlan(rename_fields={"a": "x", "b": "x"})
+
+    # invalid: a static field ends up with the same output name as a renamed field
+    FieldOutputPlan(rename_fields={"a": "x"}, static_fields={"x": 1})
+    ```
+
+    Args:
+        rename_fields: mapping of source field names to final output names
+        static_fields: mapping of static field names to their values; the keys
+            are subject to `rename_fields`
+
+    *Added in 4.3*
+    """
+
+    def __init__(
+        self,
+        rename_fields: dict[str, str] | None = None,
+        static_fields: dict[str, Any] | None = None,
+    ) -> None:
+        rename_fields = dict(rename_fields) if rename_fields is not None else {}
+        static_fields = dict(static_fields) if static_fields is not None else {}
+
+        # Provenance of each planned final name: final name -> (source kind, original key).
+        # rename_fields entries are registered first, then static_fields entries.
+        provenance: dict[str, tuple[str, str]] = {}
+
+        for source, target in rename_fields.items():
+            existing = provenance.get(target)
+            if existing is not None and existing != ("rename", source):
+                raise ValueError(
+                    f"Field output name conflict for {target!r}: "
+                    f"rename_fields maps both {existing[1]!r} and {source!r} to it"
+                )
+            provenance[target] = ("rename", source)
+
+        # Static fields keyed by their final output names, in declaration order.
+        planned_static_fields: dict[str, Any] = {}
+        for key, value in static_fields.items():
+            final_name = rename_fields.get(key, key)
+            existing = provenance.get(final_name)
+            # A static field whose key is itself renamed is the same field passing
+            # through rename_fields, so it is not considered a second source.
+            if existing is not None and existing != ("rename", key):
+                if existing[0] == "rename":
+                    raise ValueError(
+                        f"Field output name conflict for {final_name!r}: "
+                        f"rename_fields renames {existing[1]!r} to it but "
+                        f"static_fields also produces it from {key!r}"
+                    )
+                raise ValueError(
+                    f"Field output name conflict for {final_name!r}: "
+                    f"static_fields produces it from both {existing[1]!r} and {key!r}"
+                )
+            provenance[final_name] = ("static", key)
+            planned_static_fields[final_name] = value
+
+        self.rename_fields: dict[str, str] = rename_fields
+        self.static_fields: dict[str, Any] = planned_static_fields
+        return
+
+    def get_rename(self, key: str) -> str:
+        """Return the planned output name for `key`, defaulting to `key` itself."""
+        return self.rename_fields.get(key, key)
+
+
 class BaseJsonFormatter(logging.Formatter):
     """Base class for all formatters
 
@@ -216,12 +300,19 @@ class BaseJsonFormatter(logging.Formatter):
         # We recreate the dict in rename_fields and static_fields to support internal/external
         # references which require getting the item to do the conversion.
         # For more details see: https://github.com/nhairs/python-json-logger/pull/45
-        self.rename_fields = (
+        rename_fields = (
             {key: rename_fields[key] for key in rename_fields} if rename_fields is not None else {}
         )
-        self.static_fields = (
+        static_fields = (
             {key: static_fields[key] for key in static_fields} if static_fields is not None else {}
         )
+
+        # Build and validate the field output plan before any record is formatted.
+        # This never reads a LogRecord value or calls a serializer; it only merges
+        # rename_fields and static_fields and rejects final name conflicts.
+        self.field_output_plan = FieldOutputPlan(rename_fields, static_fields)
+        self.rename_fields = self.field_output_plan.rename_fields
+        self.static_fields = self.field_output_plan.static_fields
 
         self.rename_fields_keep_missing = rename_fields_keep_missing
         self.reserved_attrs = set(reserved_attrs if reserved_attrs is not None else RESERVED_ATTRS)
@@ -362,9 +453,13 @@ class BaseJsonFormatter(logging.Formatter):
         for field in self._required_fields:
             log_data[self._get_rename(field)] = record.__dict__.get(field)
 
-        for data_dict in [self.static_fields, message_dict]:
-            for key, value in data_dict.items():
-                log_data[self._get_rename(key)] = value
+        # static_fields are already keyed by their planned final output names, so
+        # they must not be renamed again. message_dict keys are still subject to
+        # rename_fields.
+        for key, value in self.static_fields.items():
+            log_data[key] = value
+        for key, value in message_dict.items():
+            log_data[self._get_rename(key)] = value
 
         merge_record_extra(
             record,
