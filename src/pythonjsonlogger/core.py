@@ -29,6 +29,7 @@ RESERVED_ATTRS: list[str] = [
     "exc_text",
     "filename",
     "funcName",
+    "getMessage",
     "levelname",
     "levelno",
     "lineno",
@@ -251,9 +252,9 @@ class BaseJsonFormatter(logging.Formatter):
         #        are always type of str. We shouldn't need to override that.
         if isinstance(record.msg, dict):
             message_dict = record.msg.copy()
-            record.message = ""
+            sealed_message: str | None = ""
         else:
-            record.message = record.getMessage()
+            sealed_message = self.seal_message(record)
 
         # only format time if needed
         if "asctime" in self._required_fields:
@@ -272,10 +273,47 @@ class BaseJsonFormatter(logging.Formatter):
             message_dict["stack_info"] = self.formatStack(record.stack_info)
 
         log_data: LogData = {}
-        self.add_fields(log_data, record, message_dict)
+        self.add_fields(log_data, record, message_dict, sealed_message)
         log_data = self.process_log_record(log_data)
 
         return self.serialize_log_record(log_data)
+
+    def seal_message(self, record: logging.LogRecord) -> str:
+        """Seal the message by interpolating `msg` and `args`.
+
+        This is a one-time operation that follows the standard logging rules
+        (see :meth:`logging.LogRecord.getMessage`) and should be called only
+        once per record. The sealed message is returned so that it can be
+        used directly when building the log data, avoiding any further
+        evaluation of `msg` or `args`.
+
+        The sealed message is also cached on the record (via the standard
+        `message` attribute and an overridden `getMessage`) so that any
+        subsequent calls to :meth:`logging.LogRecord.getMessage` (e.g. from
+        other handlers) do not re-evaluate `msg` or `args`.
+
+        Args:
+            record: the record to seal the message for
+
+        Returns:
+            the sealed message string
+        """
+        # If the message has already been sealed (e.g. by another handler's
+        # formatter), return the cached result without re-sealing.
+        if getattr(record.getMessage, "__message_sealed__", False):
+            return record.getMessage()
+
+        sealed_message = record.getMessage()
+        record.message = sealed_message
+
+        # Override getMessage so subsequent calls (from other handlers) do
+        # not re-evaluate msg or args.
+        def get_sealed_message() -> str:
+            return sealed_message
+
+        get_sealed_message.__message_sealed__ = True  # type: ignore[attr-defined]
+        record.getMessage = get_sealed_message  # type: ignore[method-assign]
+        return sealed_message
 
     ## JSON Formatter Specific Methods
     ## -------------------------------------------------------------------------
@@ -343,6 +381,7 @@ class BaseJsonFormatter(logging.Formatter):
         log_data: dict[str, Any],
         record: logging.LogRecord,
         message_dict: dict[str, Any],
+        sealed_message: str | None = None,
     ) -> None:
         """Extract fields from a LogRecord for logging
 
@@ -353,14 +392,24 @@ class BaseJsonFormatter(logging.Formatter):
             record: the record to extract data from
             message_dict: dictionary that was logged instead of a message. e.g
                 `logger.info({"is_this_message_dict": True})`
+            sealed_message: the sealed message string, produced by
+                :meth:`seal_message`. When provided it is used for the `message`
+                field instead of re-evaluating `record.msg` or `record.args`.
 
         *Changed in 4.0*: `log_record` renamed to `log_data`
         """
         for field in self.defaults:
             log_data[self._get_rename(field)] = self.defaults[field]
 
+        # Track whether the message field was supplied by the caller's dict
+        # message so that it is not overwritten by the sealed message.
+        message_from_dict = bool(message_dict) and "message" in message_dict
+
         for field in self._required_fields:
-            log_data[self._get_rename(field)] = record.__dict__.get(field)
+            if field == "message" and sealed_message is not None:
+                log_data[self._get_rename(field)] = sealed_message
+            else:
+                log_data[self._get_rename(field)] = record.__dict__.get(field)
 
         for data_dict in [self.static_fields, message_dict]:
             for key, value in data_dict.items():
@@ -372,6 +421,11 @@ class BaseJsonFormatter(logging.Formatter):
             reserved=self._skip_fields,
             rename_fields=self.rename_fields,
         )
+
+        # Ensure the sealed message is not overwritten by extra processing.
+        # Do not overwrite if the message came from the message dict.
+        if sealed_message is not None and not message_from_dict and "message" in log_data:
+            log_data["message"] = sealed_message
 
         if self.timestamp:
             key = self.timestamp if isinstance(self.timestamp, str) else "timestamp"

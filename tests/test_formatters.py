@@ -470,7 +470,6 @@ def test_log_extra(env: LoggingEnvironment, class_: type[BaseJsonFormatter]):
 @pytest.mark.parametrize("class_", ALL_FORMATTERS)
 def test_custom_logic_adds_field(env: LoggingEnvironment, class_: type[BaseJsonFormatter]):
     class CustomJsonFormatter(class_):  # type: ignore[valid-type,misc]
-
         def process_log_record(self, log_data):
             log_data["custom"] = "value"
             return super().process_log_record(log_data)
@@ -924,4 +923,152 @@ def test_json_ensure_ascii_false(env: LoggingEnvironment):
     # Note: we don't use env.load_json as we want to know the raw output
     msg = env.buffer.getvalue().split('"message": "', 1)[1].split('"', 1)[0]
     assert msg == "Привет"
+    return
+
+
+## Message Sealing Tests
+## -----------------------------------------------------------------------------
+class CountingStr:
+    """Helper that counts how many times __str__ is called."""
+
+    def __init__(self) -> None:
+        self.str_count = 0
+
+    def __str__(self) -> str:
+        self.str_count += 1
+        return f"counted({self.str_count})"
+
+
+@pytest.mark.parametrize("class_", ALL_FORMATTERS)
+def test_sealed_message_consistent_across_handlers(
+    env: LoggingEnvironment, class_: type[BaseJsonFormatter]
+):
+    """The sealed message must be consistent even when multiple handlers format the record."""
+    env.set_formatter(class_())
+
+    obj = CountingStr()
+    env.logger.info("value: %s", obj)
+
+    # The output from the test handler must contain the sealed message.
+    log_json = env.load_json()
+    assert log_json["message"] == "value: counted(1)"
+
+    # str() must only have been called once, even though pytest's root logger
+    # also has handlers that format the same record.
+    assert obj.str_count == 1
+    return
+
+
+@pytest.mark.parametrize("class_", ALL_FORMATTERS)
+def test_counting_object_str_called_once(env: LoggingEnvironment, class_: type[BaseJsonFormatter]):
+    """A custom object's __str__ must be called only once during interpolation."""
+    env.set_formatter(class_())
+
+    obj = CountingStr()
+    env.logger.info("value: %s", obj)
+    log_json = env.load_json()
+
+    assert log_json["message"] == "value: counted(1)"
+    assert obj.str_count == 1
+    return
+
+
+@pytest.mark.parametrize("class_", ALL_FORMATTERS)
+def test_counting_object_str_called_once_mapping_args(
+    env: LoggingEnvironment, class_: type[BaseJsonFormatter]
+):
+    """A custom object's __str__ must be called only once with mapping args."""
+    env.set_formatter(class_())
+
+    obj = CountingStr()
+    env.logger.info("value: %(key)s", {"key": obj})
+    log_json = env.load_json()
+
+    assert log_json["message"] == "value: counted(1)"
+    assert obj.str_count == 1
+    return
+
+
+@pytest.mark.parametrize("class_", ALL_FORMATTERS)
+def test_extra_message_does_not_overwrite_sealed(
+    env: LoggingEnvironment, class_: type[BaseJsonFormatter]
+):
+    """A `message` key in extra must not replace the sealed message.
+
+    We use a formatter with an empty reserved_attrs set so that `message` is
+    not skipped by merge_record_extra. The sealed message must still win.
+    """
+    env.set_formatter(class_(reserved_attrs=[]))
+
+    # makeRecord raises KeyError if extra tries to overwrite `message`, so we
+    # simulate the scenario by manually setting record.message before format.
+    original_format = class_.format
+
+    def format_with_extra_message(self: BaseJsonFormatter, record: logging.LogRecord) -> str:
+        record.message = "extra-message"
+        return original_format(self, record)
+
+    class_.format = format_with_extra_message  # type: ignore[method-assign]
+    try:
+        env.logger.info("sealed-message")
+    finally:
+        class_.format = original_format  # type: ignore[method-assign]
+
+    log_json = env.load_json()
+    assert log_json["message"] == "sealed-message"
+    return
+
+
+@pytest.mark.parametrize("class_", ALL_FORMATTERS)
+def test_normal_string_args(env: LoggingEnvironment, class_: type[BaseJsonFormatter]):
+    """Normal string args must interpolate correctly."""
+    env.set_formatter(class_())
+
+    env.logger.info("hello %s", "world")
+    log_json = env.load_json()
+
+    assert log_json["message"] == "hello world"
+    return
+
+
+@pytest.mark.parametrize("class_", ALL_FORMATTERS)
+def test_mapping_args(env: LoggingEnvironment, class_: type[BaseJsonFormatter]):
+    """Mapping args must interpolate correctly."""
+    env.set_formatter(class_())
+
+    env.logger.info("hello %(name)s", {"name": "world"})
+    log_json = env.load_json()
+
+    assert log_json["message"] == "hello world"
+    return
+
+
+@pytest.mark.parametrize("class_", ALL_FORMATTERS)
+def test_three_record_example(env: LoggingEnvironment, class_: type[BaseJsonFormatter]):
+    """Three-record example: string, args, and dict messages."""
+    env.set_formatter(class_())
+
+    # Record 1: plain string
+    env.logger.info("plain message")
+
+    # Record 2: string with args
+    obj = CountingStr()
+    env.logger.info("args message: %s", obj)
+
+    # Record 3: dict message
+    env.logger.info({"dict_key": "dict_value"})
+
+    lines = env.buffer.getvalue().strip().split("\n")
+    assert len(lines) == 3
+
+    record1 = json.loads(lines[0])
+    assert record1["message"] == "plain message"
+
+    record2 = json.loads(lines[1])
+    assert record2["message"] == "args message: counted(1)"
+    assert obj.str_count == 1
+
+    record3 = json.loads(lines[2])
+    assert record3["dict_key"] == "dict_value"
+    assert record3["message"] == ""
     return
