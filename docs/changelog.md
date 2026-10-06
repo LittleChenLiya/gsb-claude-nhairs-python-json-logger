@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [4.2.1](https://github.com/nhairs/python-json-logger/compare/v4.2.0...v4.2.1) - UNRELEASED
 
+### Added
+- `BaseJsonFormatter.seal_record_message`: one-shot entry point that interpolates `record.msg` and `record.args` following standard logging rules and stores the result on `record.message`. Once sealed, `extra` processing can neither re-evaluate the message nor overwrite it (e.g. an extra field renamed to `message`).
+
 ### Removed
 - `STYLE_STRING_FORMAT_REGEX`, which is no longer used to find `{` style fields. [#75](https://github.com/nhairs/python-json-logger/pull/75)
 

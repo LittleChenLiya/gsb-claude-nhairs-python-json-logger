@@ -245,15 +245,18 @@ class BaseJsonFormatter(logging.Formatter):
 
         *Changed in 4.2.0*: a `dict` `record.msg` is copied instead of modified
         in place.
+
+        *Changed in 4.2.1*: the message is sealed exactly once via
+        [`seal_record_message`][pythonjsonlogger.core.BaseJsonFormatter.seal_record_message]
+        and can no longer be overwritten by `extra` attributes.
         """
         message_dict: dict[str, Any] = {}
         # TODO: logging.LogRecord.msg and logging.LogRecord.message in typeshed
         #        are always type of str. We shouldn't need to override that.
         if isinstance(record.msg, dict):
             message_dict = record.msg.copy()
-            record.message = ""
-        else:
-            record.message = record.getMessage()
+
+        self.seal_record_message(record)
 
         # only format time if needed
         if "asctime" in self._required_fields:
@@ -279,6 +282,34 @@ class BaseJsonFormatter(logging.Formatter):
 
     ## JSON Formatter Specific Methods
     ## -------------------------------------------------------------------------
+    def seal_record_message(self, record: logging.LogRecord) -> str:
+        """Seal the record's message exactly once, following standard logging rules.
+
+        The message is computed using
+        [`logging.LogRecord.getMessage()`][logging.LogRecord.getMessage], i.e.
+        `record.msg` is converted with `str()` and, when `record.args` is present,
+        interpolated with `%` (both positional and mapping args are supported).
+        The result is stored on `record.message` and returned.
+
+        Once sealed, later processing of `extra` attributes must not re-evaluate
+        the message (e.g. call `str()` on `record.msg` again) nor overwrite the
+        sealed value in the output. When `record.msg` is a `dict` there is no
+        message to interpolate and the sealed message is the empty string.
+
+        Args:
+            record: the record whose message should be sealed
+
+        Returns:
+            the sealed message
+
+        *New in 4.2.1*
+        """
+        if isinstance(record.msg, dict):
+            record.message = ""
+        else:
+            record.message = record.getMessage()
+        return record.message
+
     def parse(self) -> list[str]:
         """Parses format string looking for substitutions
 
@@ -372,6 +403,11 @@ class BaseJsonFormatter(logging.Formatter):
             reserved=self._skip_fields,
             rename_fields=self.rename_fields,
         )
+
+        # The message sealed by `seal_record_message` must not be overwritten by
+        # `extra` attributes (e.g. an extra field renamed to "message").
+        if "message" in self._required_fields and not isinstance(record.msg, dict):
+            log_data[self._get_rename("message")] = record.message
 
         if self.timestamp:
             key = self.timestamp if isinstance(self.timestamp, str) else "timestamp"
