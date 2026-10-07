@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [4.2.1](https://github.com/nhairs/python-json-logger/compare/v4.2.0...v4.2.1) - UNRELEASED
 
+### Added
+- `exc_str_once` option on `pythonjsonlogger.core.BaseJsonFormatter` that evaluates the exception's string representation only once per record and shares it between the `message` and `exc_info` fields. If the exception's `__str__` fails, an explicit placeholder containing the exception type name is used and `__str__` is not called again.
+
 ### Removed
 - `STYLE_STRING_FORMAT_REGEX`, which is no longer used to find `{` style fields. [#75](https://github.com/nhairs/python-json-logger/pull/75)
 
