@@ -739,6 +739,212 @@ def test_exc_info_as_array_no_exc_info(env: LoggingEnvironment, class_: type[Bas
     return
 
 
+## Exception string single evaluation (exc_str_single_eval)
+## -----------------------------------------------------------------------------
+class CountingStrException(Exception):
+    """Exception that counts how many times its __str__ is evaluated"""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.str_calls = 0
+        return
+
+    def __str__(self) -> str:
+        self.str_calls += 1
+        return super().__str__()
+
+
+class BrokenStrException(Exception):
+    """Exception whose __str__ always raises (and counts attempts)"""
+
+    def __init__(self):
+        super().__init__("this message is never stringified")
+        self.str_calls = 0
+        return
+
+    def __str__(self) -> str:
+        self.str_calls += 1
+        raise RuntimeError("__str__ is broken")
+
+
+BROKEN_STR_PLACEHOLDER = "<unprintable BrokenStrException object>"
+
+
+@pytest.mark.parametrize("class_", ALL_FORMATTERS)
+def test_exc_str_single_eval_counting(env: LoggingEnvironment, class_: type[BaseJsonFormatter]):
+    """Exception string is evaluated once and shared by message and exc_info"""
+    env.logger.propagate = False
+    env.set_formatter(class_(exc_str_single_eval=True))
+
+    try:
+        raise CountingStrException("counting boom")
+    except CountingStrException as exc:
+        env.logger.error(exc, exc_info=True)
+        counting_exc = exc
+
+    log_json = env.load_json()
+
+    assert log_json["message"] == "counting boom"
+    assert "CountingStrException: counting boom" in log_json["exc_info"]
+    assert counting_exc.str_calls == 1
+    return
+
+
+@pytest.mark.parametrize("class_", ALL_FORMATTERS)
+def test_exc_str_single_eval_broken_str(env: LoggingEnvironment, class_: type[BaseJsonFormatter]):
+    """Failing __str__ uses an explicit placeholder with the type name, evaluated once"""
+    env.logger.propagate = False
+    env.set_formatter(class_(exc_str_single_eval=True))
+
+    try:
+        raise BrokenStrException()
+    except BrokenStrException as exc:
+        env.logger.error(exc, exc_info=True)
+        broken_exc = exc
+
+    log_json = env.load_json()
+
+    assert log_json["message"] == BROKEN_STR_PLACEHOLDER
+    assert f"BrokenStrException: {BROKEN_STR_PLACEHOLDER}" in log_json["exc_info"]
+    # __str__ must not be triggered a second time
+    assert broken_exc.str_calls == 1
+    return
+
+
+@pytest.mark.parametrize("class_", ALL_FORMATTERS)
+def test_exc_str_single_eval_normal_exception(
+    env: LoggingEnvironment, class_: type[BaseJsonFormatter]
+):
+    """Normal exceptions produce output identical to the default formatter"""
+    env.logger.propagate = False
+    env.logger.propagate = False
+    env.set_formatter(class_(exc_str_single_eval=True))
+
+    try:
+        raise ValueError("normal error")
+    except ValueError:
+        exc_info = sys.exc_info()
+        env.logger.exception("oops")
+
+    log_json = env.load_json()
+
+    assert log_json["message"] == "oops"
+    assert "ValueError: normal error" in log_json["exc_info"]
+
+    # log the same exception through the default formatter and compare output
+    default_env_buffer = io.StringIO()
+    default_handler = logging.StreamHandler(default_env_buffer)
+    default_handler.setFormatter(class_())
+    env.logger.removeHandler(env.handler)
+    env.logger.addHandler(default_handler)
+    try:
+        env.logger.error("oops", exc_info=exc_info)
+    finally:
+        env.logger.removeHandler(default_handler)
+        env.logger.addHandler(env.handler)
+    default_log_json = json.loads(default_env_buffer.getvalue())
+
+    assert log_json["exc_info"] == default_log_json["exc_info"]
+    return
+
+
+@pytest.mark.parametrize("class_", ALL_FORMATTERS)
+def test_exc_str_single_eval_no_exception(env: LoggingEnvironment, class_: type[BaseJsonFormatter]):
+    """Records without exceptions are unaffected by the option"""
+    env.logger.propagate = False
+    env.set_formatter(class_(exc_str_single_eval=True))
+
+    env.logger.info("plain message", extra={"extra_field": "extra_value"})
+    log_json = env.load_json()
+
+    assert log_json["message"] == "plain message"
+    assert log_json["extra_field"] == "extra_value"
+    assert "exc_info" not in log_json
+    return
+
+
+@pytest.mark.parametrize("class_", ALL_FORMATTERS)
+def test_exc_str_single_eval_as_array(env: LoggingEnvironment, class_: type[BaseJsonFormatter]):
+    """exc_str_single_eval is compatible with exc_info_as_array"""
+    env.logger.propagate = False
+    env.set_formatter(class_(exc_str_single_eval=True, exc_info_as_array=True))
+
+    try:
+        raise CountingStrException("array boom")
+    except CountingStrException as exc:
+        env.logger.error(exc, exc_info=True)
+        counting_exc = exc
+
+    log_json = env.load_json()
+
+    assert log_json["message"] == "array boom"
+    assert isinstance(log_json["exc_info"], list)
+    assert "CountingStrException: array boom" in "\n".join(log_json["exc_info"])
+    assert counting_exc.str_calls == 1
+    return
+
+
+@pytest.mark.parametrize("class_", ALL_FORMATTERS)
+def test_exc_str_default_interface_double_eval(
+    env: LoggingEnvironment, class_: type[BaseJsonFormatter]
+):
+    """Regression: without the option the original interface is unchanged,
+    i.e. the exception string is evaluated once per field (message + exc_info)"""
+    env.logger.propagate = False
+    env.set_formatter(class_())
+
+    try:
+        raise CountingStrException("default boom")
+    except CountingStrException as exc:
+        env.logger.error(exc, exc_info=True)
+        counting_exc = exc
+
+    log_json = env.load_json()
+
+    assert log_json["message"] == "default boom"
+    assert "CountingStrException: default boom" in log_json["exc_info"]
+    assert counting_exc.str_calls == 2
+    return
+
+
+@pytest.mark.parametrize("class_", ALL_FORMATTERS)
+def test_exc_str_single_eval_tmp_file(
+    env: LoggingEnvironment, class_: type[BaseJsonFormatter], tmp_path
+):
+    """Demo with a temporary file fixture: JSON lines written to disk keep the
+    single-evaluated exception string in both message and exc_info fields"""
+    log_file = tmp_path / "single_eval.log"
+    env.logger.propagate = False
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(class_(exc_str_single_eval=True))
+    env.logger.removeHandler(env.handler)
+    env.logger.addHandler(file_handler)
+    try:
+        try:
+            raise CountingStrException("file boom")
+        except CountingStrException as exc:
+            env.logger.error(exc, exc_info=True)
+            counting_exc = exc
+        env.logger.info("no exception here")
+    finally:
+        env.logger.removeHandler(file_handler)
+        env.logger.addHandler(env.handler)
+        file_handler.close()
+
+    lines = log_file.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+
+    exc_log_json = json.loads(lines[0])
+    assert exc_log_json["message"] == "file boom"
+    assert "CountingStrException: file boom" in exc_log_json["exc_info"]
+    assert counting_exc.str_calls == 1
+
+    plain_log_json = json.loads(lines[1])
+    assert plain_log_json["message"] == "no exception here"
+    assert "exc_info" not in plain_log_json
+    return
+
+
 @pytest.mark.skipif(
     sys.version_info < (3, 11), reason="Exception notes require Python 3.11 or higher"
 )

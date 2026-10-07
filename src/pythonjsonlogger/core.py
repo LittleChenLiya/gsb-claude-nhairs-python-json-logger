@@ -11,6 +11,7 @@ import logging
 import re
 import string
 import sys
+import traceback
 from typing import TypeAlias, Any
 from collections.abc import Container, Sequence
 
@@ -78,6 +79,20 @@ LogData: TypeAlias = dict[str, Any]
 
 ### FUNCTIONS
 ### ============================================================================
+def _safe_exception_str(exc: BaseException) -> str:
+    """Evaluate `str(exc)` exactly once.
+
+    If the exception's `__str__` fails, an explicit placeholder that preserves
+    the exception's type name is returned instead of re-triggering `__str__`.
+
+    *New in 4.3*
+    """
+    try:
+        return str(exc)
+    except Exception:  # pylint: disable=broad-except
+        return f"<unprintable {type(exc).__name__} object>"
+
+
 def merge_record_extra(
     record: logging.LogRecord,
     target: dict[Any, Any],
@@ -107,6 +122,32 @@ def merge_record_extra(
 
 ### CLASSES
 ### ============================================================================
+class _PrecomputedStrExceptionProxy:
+    """Proxy for an exception whose string representation has already been evaluated.
+
+    `traceback.TracebackException` calls `str()` on the exception value it is
+    given. By wrapping the real exception in this proxy, tracebacks can be
+    formatted using the precomputed string without re-evaluating the original
+    exception's `__str__`. All other attribute access is delegated to the
+    wrapped exception.
+
+    *New in 4.3*
+    """
+
+    __slots__ = ("_exc", "_exc_str")
+
+    def __init__(self, exc: BaseException, exc_str: str) -> None:
+        object.__setattr__(self, "_exc", exc)
+        object.__setattr__(self, "_exc_str", exc_str)
+        return
+
+    def __str__(self) -> str:
+        return object.__getattribute__(self, "_exc_str")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_exc"), name)
+
+
 class BaseJsonFormatter(logging.Formatter):
     """Base class for all formatters
 
@@ -136,6 +177,7 @@ class BaseJsonFormatter(logging.Formatter):
         defaults: dict[str, Any] | None = None,
         exc_info_as_array: bool = False,
         stack_info_as_array: bool = False,
+        exc_str_single_eval: bool = False,
     ) -> None:
         """
         Args:
@@ -160,6 +202,11 @@ class BaseJsonFormatter(logging.Formatter):
                 will be "timestamp". Defaults to False/off.
             exc_info_as_array: break the exc_info into a list of lines based on line breaks.
             stack_info_as_array: break the stack_info into a list of lines based on line breaks.
+            exc_str_single_eval: evaluate the exception's string representation at most
+                once per log record and share it between the `message` and `exc_info`
+                fields. If the exception's `__str__` fails, an explicit placeholder
+                containing the exception's type name is used and `__str__` is not
+                called again. Defaults to False/off, preserving the original behaviour.
 
         *Changed in 3.1*:
 
@@ -180,6 +227,8 @@ class BaseJsonFormatter(logging.Formatter):
           to `python-json-logger` and thus care should be taken to not to pass this format to other
           logging Formatter implementations.
         - `fmt` now supports sequences of strings (e.g. lists and tuples) of field names.
+
+        *Added in 4.3*: `exc_str_single_eval` option is added.
         """
         ## logging.Formatter compatibility
         ## ---------------------------------------------------------------------
@@ -232,6 +281,7 @@ class BaseJsonFormatter(logging.Formatter):
         self.defaults = defaults if defaults is not None else {}
         self.exc_info_as_array = exc_info_as_array
         self.stack_info_as_array = stack_info_as_array
+        self.exc_str_single_eval = exc_str_single_eval
         return
 
     def format(self, record: logging.LogRecord) -> str:
@@ -245,13 +295,31 @@ class BaseJsonFormatter(logging.Formatter):
 
         *Changed in 4.2.0*: a `dict` `record.msg` is copied instead of modified
         in place.
+
+        *Changed in 4.3*: when `exc_str_single_eval` is enabled the exception's
+        string representation is evaluated at most once and shared between the
+        `message` and `exc_info` fields.
         """
+        # When enabled, evaluate the exception's string representation exactly
+        # once so it can be shared between the message and exc_info fields.
+        exc_str: str | None = None
+        if (
+            self.exc_str_single_eval
+            and record.exc_info
+            and isinstance(record.exc_info[1], BaseException)
+        ):
+            exc_str = _safe_exception_str(record.exc_info[1])
+
         message_dict: dict[str, Any] = {}
         # TODO: logging.LogRecord.msg and logging.LogRecord.message in typeshed
         #        are always type of str. We shouldn't need to override that.
         if isinstance(record.msg, dict):
             message_dict = record.msg.copy()
             record.message = ""
+        elif exc_str is not None and record.msg is record.exc_info[1] and not record.args:  # type: ignore[index]
+            # The exception itself is being logged as the message: reuse the
+            # already evaluated string instead of calling __str__ again.
+            record.message = exc_str
         else:
             record.message = record.getMessage()
 
@@ -262,7 +330,12 @@ class BaseJsonFormatter(logging.Formatter):
         # Display formatted exception, but allow overriding it in the
         # user-supplied dict.
         if record.exc_info and not message_dict.get("exc_info"):
-            message_dict["exc_info"] = self.formatException(record.exc_info)
+            if exc_str is not None:
+                message_dict["exc_info"] = self._format_exception_single_eval(
+                    record.exc_info, exc_str
+                )
+            else:
+                message_dict["exc_info"] = self.formatException(record.exc_info)
         if not message_dict.get("exc_info") and record.exc_text:
             message_dict["exc_info"] = record.exc_text
 
@@ -421,6 +494,29 @@ class BaseJsonFormatter(logging.Formatter):
         If exc_info_as_array is set to True, This method returns an array of strings.
         """
         exception_info_str = super().formatException(ei)
+        return exception_info_str.splitlines() if self.exc_info_as_array else exception_info_str
+
+    def _format_exception_single_eval(self, ei, exc_str: str) -> str | list[str]:
+        """Format exception information using an already evaluated exception string.
+
+        The exception's `__str__` is not called again; `exc_str` is used in its
+        place. If exc_info_as_array is set to True, this method returns an array
+        of strings.
+
+        *New in 4.3*
+        """
+        exc_type, exc_value, exc_traceback = ei
+        proxy = _PrecomputedStrExceptionProxy(exc_value, exc_str)
+        exception_info_str = "".join(
+            traceback.TracebackException(
+                exc_type,
+                proxy,  # type: ignore[arg-type]
+                exc_traceback,
+            ).format()
+        )
+        # Match logging.Formatter.formatException which strips the trailing newline
+        if exception_info_str.endswith("\n"):
+            exception_info_str = exception_info_str[:-1]
         return exception_info_str.splitlines() if self.exc_info_as_array else exception_info_str
 
     def formatStack(self, stack_info) -> str | list[str]:  # type: ignore[override]
