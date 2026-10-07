@@ -25,3 +25,13 @@ class MissingPackageError(ImportError, PythonJsonLoggerError):
             msg += f" It can be installed using 'python-json-logger[{extras_name}]'."
         super().__init__(msg)
         return
+
+
+class RedactionError(PythonJsonLoggerError):
+    """Raised when redacting fields fails.
+
+    For example when a circular reference is encountered whilst traversing
+    the containers holding the explicitly configured field paths.
+
+    *New in 4.2.1*
+    """

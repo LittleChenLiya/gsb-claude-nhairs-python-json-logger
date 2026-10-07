@@ -279,3 +279,41 @@ logger.debug(
 )
 print(f"Logging DEBUG using LazyString took: {int(time.time() - start)}s")
 ```
+
+## Redacting nested fields
+
+Use `redact_fields` to replace values at **explicit** field paths before serialization. Each path is a sequence of `dict` keys; integer (or all-digit string) segments address a single `list` item by position. Missing paths are ignored (no fields are added), same-named fields at other paths are left untouched, and a circular reference raises `pythonjsonlogger.exception.RedactionError`. Modified `dict`/`list` containers are copied so the original `LogRecord` data is never changed; without `redact_fields` the normal encoder is used as before.
+
+```python
+import logging
+from pythonjsonlogger.json import JsonFormatter
+
+handler = logging.StreamHandler()
+handler.setFormatter(
+    JsonFormatter(
+        redact_fields=[
+            ("data", "users", 0, "ssn"),
+            ("data", "users", 1, "ssn"),
+        ]
+    )
+)
+logger = logging.getLogger()
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+logger.info(
+    "login",
+    extra={
+        "data": {
+            "users": [
+                {"name": "Ada", "ssn": "111-22-3333"},
+                {"name": "Grace", "ssn": "444-55-6666"},
+            ],
+            "ssn": "non-target, kept as-is",
+        }
+    },
+)
+# {"message":"login","data":{"users":[{"name":"Ada","ssn":"[REDACTED]"},{"name":"Grace","ssn":"[REDACTED]"}],"ssn":"non-target, kept as-is"}}
+```
+
+Use `redact_value` to change the replacement (for example `None`).

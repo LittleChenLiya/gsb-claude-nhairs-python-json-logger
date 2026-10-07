@@ -17,10 +17,13 @@ from collections.abc import Container, Sequence
 ## Installed
 
 ## Application
-
+from .exception import RedactionError
 
 ### CONSTANTS
 ### ============================================================================
+_REDACTION_TERMINAL: Any = object()
+"""Sentinel marking the end of a configured redaction path in the path trie."""
+
 RESERVED_ATTRS: list[str] = [
     "args",
     "asctime",
@@ -75,6 +78,16 @@ LogData: TypeAlias = dict[str, Any]
 *Changed in 4.0*: renamed from `LogRecord` to `LogData`
 """
 
+RedactionPath: TypeAlias = Sequence[str | int]
+"""An explicit path to a field that should be redacted.
+
+Each element is a `dict` key. Elements that are integers (or strings of
+digits) additionally address a single `list` item by its position.
+"""
+
+RedactionTrie: TypeAlias = dict[Any, Any]
+"""Trie mapping explicit redaction paths to their nested containers."""
+
 
 ### FUNCTIONS
 ### ============================================================================
@@ -105,6 +118,106 @@ def merge_record_extra(
     return target
 
 
+def _build_redaction_trie(paths: Any, replacement: Any) -> RedactionTrie:
+    """Build a lookup trie from the explicitly configured redaction paths.
+
+    Terminal nodes map `_REDACTION_TERMINAL` to the replacement value.
+    """
+    trie: RedactionTrie = {}
+    for path in paths:
+        if isinstance(path, (str, int)) or not isinstance(path, Sequence):
+            raise TypeError(f"redact_fields paths must be sequences of str/int, got {path!r}")
+        if not path:
+            raise ValueError("redact_fields paths must not be empty")
+        node = trie
+        for segment in path:
+            if not isinstance(segment, (str, int)) or isinstance(segment, bool):
+                raise TypeError(f"redact_fields path segments must be str or int, got {segment!r}")
+            # all-digit strings address a list item just like an integer
+            if isinstance(segment, str) and segment.isdigit():
+                segment = int(segment)
+            node = node.setdefault(segment, {})
+        node[_REDACTION_TERMINAL] = replacement
+    return trie
+
+
+def _format_redaction_path(path: Sequence[Any]) -> str:
+    """Render a traversed container path for use in error messages."""
+    return ".".join(str(segment) for segment in path)
+
+
+def _dict_child_trie(trie: RedactionTrie, key: Any) -> RedactionTrie | None:
+    """Return the trie for a dict key.
+
+    An all-digit string key also matches the equivalent integer segment (the
+    same segment can target a list item elsewhere in the structure).
+    """
+    if key in trie:
+        return trie[key]
+    if isinstance(key, str) and key.isdigit() and int(key) in trie:
+        return trie[int(key)]
+    return None
+
+
+def _redact_container(
+    value: Any,
+    trie: RedactionTrie,
+    path: list[Any],
+    seen: set[int],
+) -> Any:
+    """Recursively replace values at explicit paths.
+
+    Only `dict` and `list` containers are traversed. Containers that are
+    modified are copied; unchanged containers are shared with the input so
+    the source `LogRecord` data is never mutated.
+    """
+    if not isinstance(value, (dict, list)):
+        # a configured path ends here (possibly alongside deeper paths)
+        if _REDACTION_TERMINAL in trie:
+            return trie[_REDACTION_TERMINAL]
+        return value
+
+    value_id = id(value)
+    if value_id in seen:
+        raise RedactionError(
+            f"Circular reference detected while redacting field path"
+            f" '{_format_redaction_path(path)}'"
+        )
+    seen.add(value_id)
+
+    if isinstance(value, dict):
+        # (path segment, configured child trie or None, key for writing back)
+        entries = [(key, _dict_child_trie(trie, key), key) for key in value]
+    else:
+        entries = [(index, trie.get(index), index) for index in range(len(value))]
+
+    result: dict[Any, Any] | list[Any] | None = None
+    for segment, child_trie, write_key in entries:
+        item = value[write_key]
+        if child_trie is None:
+            # Cycle detection applies to the whole traversed structure so
+            # cycles outside the configured paths are reported by this library
+            # rather than leaking as encoder errors.
+            new_item = _redact_container(item, {}, [*path, segment], seen)
+        else:
+            path.append(segment)
+            if _REDACTION_TERMINAL in child_trie and len(child_trie) == 1:
+                new_item = child_trie[_REDACTION_TERMINAL]
+            else:
+                # the terminal may coexist with deeper paths (a configured
+                # path prefix); the sentinel key is never a real container key
+                new_item = _redact_container(item, child_trie, path, seen)
+            path.pop()
+
+        if result is None and new_item is not item:
+            result = dict(value) if isinstance(value, dict) else list(value)
+        if result is not None:
+            result[write_key] = new_item
+
+    seen.remove(value_id)
+    return value if result is None else result
+
+
 ### CLASSES
 ### ============================================================================
 class BaseJsonFormatter(logging.Formatter):
@@ -119,7 +232,7 @@ class BaseJsonFormatter(logging.Formatter):
 
     ## Parent Methods
     ## -------------------------------------------------------------------------
-    # pylint: disable=too-many-arguments,super-init-not-called
+    # pylint: disable=too-many-arguments,super-init-not-called,too-many-locals
     def __init__(
         self,
         fmt: str | Sequence[str] | None = None,
@@ -136,6 +249,8 @@ class BaseJsonFormatter(logging.Formatter):
         defaults: dict[str, Any] | None = None,
         exc_info_as_array: bool = False,
         stack_info_as_array: bool = False,
+        redact_fields: Sequence[RedactionPath] | None = None,
+        redact_value: Any = "[REDACTED]",
     ) -> None:
         """
         Args:
@@ -160,6 +275,15 @@ class BaseJsonFormatter(logging.Formatter):
                 will be "timestamp". Defaults to False/off.
             exc_info_as_array: break the exc_info into a list of lines based on line breaks.
             stack_info_as_array: break the stack_info into a list of lines based on line breaks.
+            redact_fields: an optional sequence of explicit field paths whose values are
+                replaced with `redact_value` before serialization. Each path is a sequence of
+                `dict` keys; integer (or all-digit string) segments address a single `list`
+                item by position. Paths that do not exist are ignored (no fields are added).
+                `dict` and `list` containers holding redacted values are copied, so the
+                original `LogRecord` data is never modified. A circular reference encountered
+                while traversing raises a
+                [RedactionError][pythonjsonlogger.exception.RedactionError].
+            redact_value: the value used to replace redacted fields. Defaults to `"[REDACTED]"`.
 
         *Changed in 3.1*:
 
@@ -232,6 +356,12 @@ class BaseJsonFormatter(logging.Formatter):
         self.defaults = defaults if defaults is not None else {}
         self.exc_info_as_array = exc_info_as_array
         self.stack_info_as_array = stack_info_as_array
+
+        # Redaction configuration (explicit field paths only): the replacement
+        # value is stored at each path's terminal node
+        self._redact_trie = (
+            _build_redaction_trie(redact_fields, redact_value) if redact_fields is not None else {}
+        )
         return
 
     def format(self, record: logging.LogRecord) -> str:
@@ -274,6 +404,7 @@ class BaseJsonFormatter(logging.Formatter):
         log_data: LogData = {}
         self.add_fields(log_data, record, message_dict)
         log_data = self.process_log_record(log_data)
+        log_data = self.redact_log_data(log_data)
 
         return self.serialize_log_record(log_data)
 
@@ -414,6 +545,27 @@ class BaseJsonFormatter(logging.Formatter):
         *Changed in 4.0*: `log_record` renamed to `log_data`
         """
         return log_data
+
+    def redact_log_data(self, log_data: LogData) -> LogData:
+        """Replace values at the configured explicit field paths.
+
+        Only paths given via `redact_fields` are modified; missing paths do
+        not cause fields to be added. Traversed `dict` and `list` containers
+        are copied when modified, leaving the source `LogRecord` data
+        untouched.
+
+        Args:
+            log_data: data that will be logged
+
+        Raises:
+            RedactionError: if a circular reference is encountered while
+                traversing the containers.
+
+        *New in 4.2.1*
+        """
+        if not self._redact_trie:
+            return log_data
+        return _redact_container(log_data, self._redact_trie, path=[], seen=set())
 
     def formatException(self, ei) -> str | list[str]:  # type: ignore[override]
         """Format and return the specified exception information.
