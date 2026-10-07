@@ -37,6 +37,21 @@ class SillyFormatter(JsonFormatter):
         return new_record
 ```
 
+## Redacting nested fields
+
+Pass `redact_fields` to redact only explicitly specified nested field paths before serialization. Paths may be dotted strings (`"user.password"`) or sequences of keys (`("user", "password")`); lists are traversed transparently so a path applies to every list element.
+
+Provide a sequence of paths to use the default replacement (`"***REDACTED***"`), or a mapping of paths to replacement values:
+
+```python
+from pythonjsonlogger.json import JsonFormatter
+
+formatter = JsonFormatter(redact_fields=["user.password", "accounts.token"])
+formatter = JsonFormatter(redact_fields={"user.password": "[redacted]", "accounts.token": None})
+```
+
+Only fields matching the full path are changed: a same-named field at another level is left untouched, paths that do not exist do not add fields, and the original `LogRecord` data is never modified. Circular references encountered during traversal raise `pythonjsonlogger.JsonFormatError`.
+
 
 ## Request / Trace IDs
 

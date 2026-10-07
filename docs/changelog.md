@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [4.2.1](https://github.com/nhairs/python-json-logger/compare/v4.2.0...v4.2.1) - UNRELEASED
 
+### Added
+- `redact_fields` argument for all formatters: redact explicitly specified nested field paths (dotted strings or sequences of keys; lists are traversed transparently). Missing paths do not add fields, same-named fields outside an explicit path are untouched, only modified `dict`/`list` containers are copied (the original `LogRecord` data is never mutated), and circular references raise the new `pythonjsonlogger.exception.JsonFormatError`.
+
 ### Removed
 - `STYLE_STRING_FORMAT_REGEX`, which is no longer used to find `{` style fields. [#75](https://github.com/nhairs/python-json-logger/pull/75)
 

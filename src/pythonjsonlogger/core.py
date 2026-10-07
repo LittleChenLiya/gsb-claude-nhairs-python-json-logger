@@ -12,12 +12,12 @@ import re
 import string
 import sys
 from typing import TypeAlias, Any
-from collections.abc import Container, Sequence
+from collections.abc import Container, Sequence, Mapping
 
 ## Installed
 
 ## Application
-
+from . import redaction
 
 ### CONSTANTS
 ### ============================================================================
@@ -115,11 +115,13 @@ class BaseJsonFormatter(logging.Formatter):
     *New in 3.1*
     """
 
+    # pylint: disable=too-many-instance-attributes
+
     _style: logging.PercentStyle | str  # type: ignore[assignment]
 
     ## Parent Methods
     ## -------------------------------------------------------------------------
-    # pylint: disable=too-many-arguments,super-init-not-called
+    # pylint: disable=too-many-arguments,too-many-locals,super-init-not-called
     def __init__(
         self,
         fmt: str | Sequence[str] | None = None,
@@ -136,6 +138,11 @@ class BaseJsonFormatter(logging.Formatter):
         defaults: dict[str, Any] | None = None,
         exc_info_as_array: bool = False,
         stack_info_as_array: bool = False,
+        redact_fields: (
+            Mapping[str | tuple[Any, ...] | list[Any], Any]
+            | Sequence[str | tuple[Any, ...] | list[Any]]
+            | None
+        ) = None,
     ) -> None:
         """
         Args:
@@ -160,6 +167,14 @@ class BaseJsonFormatter(logging.Formatter):
                 will be "timestamp". Defaults to False/off.
             exc_info_as_array: break the exc_info into a list of lines based on line breaks.
             stack_info_as_array: break the stack_info into a list of lines based on line breaks.
+            redact_fields: optional configuration of explicit nested field paths to redact.
+                Either a sequence of paths (each replaced with `"***REDACTED***"`) or a mapping
+                of paths to replacement values. Keys are dotted strings (e.g. `"user.password"`)
+                or sequences of dict keys (e.g. `("user", "password")`); lists are traversed
+                transparently so a path applies to every list element. Paths that do not exist
+                do not add fields and same-named fields outside an explicit path are left
+                untouched. A circular reference in a traversed `dict` or `list` raises
+                `JsonFormatError`. The original `LogRecord` data is never modified.
 
         *Changed in 3.1*:
 
@@ -232,6 +247,19 @@ class BaseJsonFormatter(logging.Formatter):
         self.defaults = defaults if defaults is not None else {}
         self.exc_info_as_array = exc_info_as_array
         self.stack_info_as_array = stack_info_as_array
+
+        # Normalise redaction configuration into a path trie used at format
+        # time. A copy is retained to decouple our state from callers' objects.
+        # A bare string is a single dotted path rather than a sequence of keys.
+        if redact_fields is None:
+            self.redact_fields: Mapping[Any, Any] | Sequence[Any] = []
+        elif isinstance(redact_fields, Mapping):
+            self.redact_fields = dict(redact_fields)
+        elif isinstance(redact_fields, str):
+            self.redact_fields = redact_fields
+        else:
+            self.redact_fields = list(redact_fields)
+        self._redaction_tree = redaction.build_redaction_tree(self.redact_fields)
         return
 
     def format(self, record: logging.LogRecord) -> str:
@@ -273,6 +301,7 @@ class BaseJsonFormatter(logging.Formatter):
 
         log_data: LogData = {}
         self.add_fields(log_data, record, message_dict)
+        log_data = self.redact_log_data(log_data)
         log_data = self.process_log_record(log_data)
 
         return self.serialize_log_record(log_data)
@@ -390,6 +419,26 @@ class BaseJsonFormatter(logging.Formatter):
 
     # Child Methods
     # ..........................................................................
+    def redact_log_data(self, log_data: LogData) -> LogData:
+        """Redact explicitly configured nested field paths from the log data.
+
+        Only fields matching a path configured via `redact_fields` are changed.
+        Containers are copied on write so the source `LogRecord` data is never
+        mutated; missing paths never add fields.
+
+        Args:
+            log_data: data that will be logged
+
+        Raises:
+            JsonFormatError: if a circular reference is found while traversing
+                `dict` and `list` containers.
+
+        *Added in 4.2.1*
+        """
+        if not self.redact_fields:
+            return log_data
+        return redaction.redact_log_data(log_data, self._redaction_tree)
+
     def jsonify_log_record(self, log_data: LogData) -> str:
         """Convert the log data into a JSON string.
 

@@ -484,6 +484,26 @@ def test_custom_logic_adds_field(env: LoggingEnvironment, class_: type[BaseJsonF
 
 
 @pytest.mark.parametrize("class_", ALL_FORMATTERS)
+def test_redact_fields_regression(env: LoggingEnvironment, class_: type[BaseJsonFormatter]):
+    """Short regression: nested redaction works through the normal logger flow."""
+    env.set_formatter(class_(redact_fields={"users.password": "***"}))
+
+    env.logger.info(
+        "message",
+        extra={
+            "users": [{"user": "a", "password": "p1"}, {"user": "b", "password": "p2"}],
+            "password": "top-level",
+        },
+    )
+    log_json = env.load_json()
+
+    assert [user["password"] for user in log_json["users"]] == ["***", "***"]
+    assert [user["user"] for user in log_json["users"]] == ["a", "b"]
+    assert log_json["password"] == "top-level"
+    return
+
+
+@pytest.mark.parametrize("class_", ALL_FORMATTERS)
 def test_exc_info(env: LoggingEnvironment, class_: type[BaseJsonFormatter]):
     env.set_formatter(class_())
 

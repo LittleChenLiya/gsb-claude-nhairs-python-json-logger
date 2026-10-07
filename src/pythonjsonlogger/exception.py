@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 ## Standard Library
+from typing import Any
 
 ## Installed
 
@@ -24,4 +25,15 @@ class MissingPackageError(ImportError, PythonJsonLoggerError):
         if extras_name is not None:
             msg += f" It can be installed using 'python-json-logger[{extras_name}]'."
         super().__init__(msg)
+        return
+
+
+class JsonFormatError(PythonJsonLoggerError):
+    "A log record could not be formatted into JSON"
+
+    def __init__(self, message: str, *, path: tuple[Any, ...] | None = None) -> None:
+        if path:
+            message = f"{message} (at field path: {'.'.join(str(part) for part in path)})"
+        super().__init__(message)
+        self.path = path
         return
